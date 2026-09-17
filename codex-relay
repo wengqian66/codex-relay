@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""One-command Codex relay switcher: change URL/key and refill model catalog."""
+
+from __future__ import print_function
+
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.request
+
+CODEX_HOME = os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
+RELAYS_PATH = os.path.join(CODEX_HOME, "relays.json")
+CONFIG_PATH = os.path.join(CODEX_HOME, "config.toml")
+AUTH_PATH = os.path.join(CODEX_HOME, "auth.json")
+CATALOG_PATH = os.path.join(CODEX_HOME, "cc-switch-model-catalog.json")
+
+TEMPLATE = {
+    "additional_speed_tiers": [],
+    "availability_nux": None,
+    "base_instructions": (
+        "You are Codex, a coding agent. You and the user share the same "
+        "workspace and collaborate to achieve the user's goals."
+    ),
+    "context_window": 128000,
+    "default_reasoning_level": "high",
+    "default_reasoning_summary": "none",
+    "effective_context_window_percent": 95,
+    "experimental_supported_tools": [],
+    "input_modalities": ["text", "image"],
+    "max_context_window": 128000,
+    "service_tiers": [],
+    "shell_type": "shell_command",
+    "support_verbosity": False,
+    "supported_in_api": True,
+    "supported_reasoning_levels": [
+        {"description": "Disable Thinking", "effort": "none"},
+        {"description": "Enabled Thinking", "effort": "high"},
+    ],
+    "supports_image_detail_original": False,
+    "supports_parallel_tool_calls": False,
+    "supports_reasoning_summaries": True,
+    "supports_search_tool": False,
+    "truncation_policy": {"limit": 10000, "mode": "bytes"},
+    "upgrade": None,
+    "visibility": "list",
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def load_relays():
+    if not os.path.isfile(RELAYS_PATH):
+        die("missing %s — create relays there first" % RELAYS_PATH)
+    with open(RELAYS_PATH, "r") as f:
+        data = json.load(f)
+    if "relays" not in data or not isinstance(data["relays"], dict):
+        die("relays.json missing relays{}")
+    return data
+
+
+def save_relays(data):
+    tmp = RELAYS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, RELAYS_PATH)
+    try:
+        os.chmod(RELAYS_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def normalize_base_url(url):
+    return url.rstrip("/")
+
+
+def fetch_models(base_url, api_key):
+    base = normalize_base_url(base_url)
+    urls = [base + "/v1/models", base + "/models"]
+    last_err = None
+    for url in urls:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+                "User-Agent": "codex-relay/1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                status = getattr(resp, "status", 200)
+        except urllib.error.HTTPError as e:
+            last_err = "HTTP %s for %s: %s" % (
+                e.code,
+                url,
+                e.read()[:200].decode("utf-8", "replace"),
+            )
+            continue
+        except Exception as e:
+            last_err = "%s for %s" % (e, url)
+            continue
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            last_err = "non-JSON from %s: %s" % (url, body[:200])
+            continue
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            last_err = "unexpected JSON from %s" % url
+            continue
+        models = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("id")
+            if not mid:
+                continue
+            models.append(
+                {
+                    "id": mid,
+                    "display_name": item.get("display_name") or mid,
+                }
+            )
+        if not models:
+            last_err = "empty model list from %s" % url
+            continue
+        return url, models, status
+    die("failed to fetch models: %s" % (last_err or "unknown"))
+
+
+def build_catalog(models):
+    out = []
+    for i, m in enumerate(models):
+        entry = dict(TEMPLATE)
+        entry["slug"] = m["id"]
+        entry["display_name"] = m["display_name"]
+        entry["description"] = m["id"]
+        entry["priority"] = 1000 + i
+        out.append(entry)
+    return {"models": out}
+
+
+def pick_model(models, preferred, current_model=None):
+    ids = [m["id"] for m in models]
+    if current_model and current_model in ids:
+        return current_model
+    for p in preferred or []:
+        if p in ids:
+            return p
+    # Prefer something that looks like a main chat model.
+    for mid in ids:
+        if mid.startswith("gpt-") and "review" not in mid and "reserve" not in mid:
+            return mid
+    return ids[0]
+
+
+def read_current_model(config_text):
+    m = re.search(r'(?m)^model\s*=\s*"([^"]+)"', config_text)
+    return m.group(1) if m else None
+
+
+def update_config(config_text, display_name, base_url, model):
+    text = config_text
+    if not re.search(r'(?m)^model_provider\s*=', text):
+        text = 'model_provider = "custom"\n' + text
+    else:
+        text = re.sub(
+            r'(?m)^model_provider\s*=\s*".*?"',
+            'model_provider = "custom"',
+            text,
+            count=1,
+        )
+    if re.search(r'(?m)^model\s*=', text):
+        text = re.sub(r'(?m)^model\s*=\s*".*?"', 'model = "%s"' % model, text, count=1)
+    else:
+        text = 'model = "%s"\n' % model + text
+
+    if not re.search(r'(?m)^model_catalog_json\s*=', text):
+        text = re.sub(
+            r'(?m)^model\s*=\s*".*?"\s*\n',
+            lambda m: m.group(0) + 'model_catalog_json = "cc-switch-model-catalog.json"\n',
+            text,
+            count=1,
+        )
+
+    # Ensure [model_providers.custom] block exists / update fields.
+    if "[model_providers.custom]" not in text:
+        text += (
+            "\n[model_providers.custom]\n"
+            'name = "%s"\n'
+            'base_url = "%s"\n'
+            'wire_api = "responses"\n'
+            "requires_openai_auth = true\n"
+        ) % (display_name.replace('"', '\\"'), base_url)
+    else:
+        # Replace name/base_url inside that section only.
+        parts = re.split(r'(?=^\[)', text, flags=re.M)
+        out = []
+        for part in parts:
+            if part.startswith("[model_providers.custom]"):
+                if re.search(r'(?m)^name\s*=', part):
+                    part = re.sub(
+                        r'(?m)^name\s*=\s*".*?"',
+                        'name = "%s"' % display_name.replace('"', '\\"'),
+                        part,
+                        count=1,
+                    )
+                else:
+                    part = part.rstrip() + '\nname = "%s"\n' % display_name.replace(
+                        '"', '\\"'
+                    )
+                if re.search(r'(?m)^base_url\s*=', part):
+                    part = re.sub(
+                        r'(?m)^base_url\s*=\s*".*?"',
+                        'base_url = "%s"' % base_url,
+                        part,
+                        count=1,
+                    )
+                else:
+                    part = part.rstrip() + '\nbase_url = "%s"\n' % base_url
+                if not re.search(r'(?m)^wire_api\s*=', part):
+                    part = part.rstrip() + '\nwire_api = "responses"\n'
+                if not re.search(r'(?m)^requires_openai_auth\s*=', part):
+                    part = part.rstrip() + "\nrequires_openai_auth = true\n"
+            out.append(part)
+        text = "".join(out)
+    return text
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.rename(tmp, path)
+
+
+def cmd_list(data):
+    cur = data.get("current")
+    print("relays in %s" % RELAYS_PATH)
+    for name, relay in sorted(data["relays"].items()):
+        mark = "*" if name == cur else " "
+        print(
+            " %s %-12s  %s  (%s)"
+            % (
+                mark,
+                name,
+                normalize_base_url(relay.get("base_url", "")),
+                relay.get("display_name", name),
+            )
+        )
+    if cur:
+        print("\ncurrent: %s" % cur)
+
+
+def cmd_current(data):
+    cur = data.get("current")
+    if not cur or cur not in data["relays"]:
+        die("no current relay set")
+    relay = data["relays"][cur]
+    print("name: %s" % cur)
+    print("display_name: %s" % relay.get("display_name", cur))
+    print("base_url: %s" % normalize_base_url(relay["base_url"]))
+    key = relay.get("api_key", "")
+    if key:
+        print("api_key: %s...%s" % (key[:8], key[-4:]))
+    if os.path.isfile(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            model = read_current_model(f.read())
+        if model:
+            print("model: %s" % model)
+
+
+def apply_relay(data, name, sync_only=False):
+    if name not in data["relays"]:
+        die("unknown relay %r — known: %s" % (name, ", ".join(sorted(data["relays"]))))
+    relay = data["relays"][name]
+    base_url = normalize_base_url(relay["base_url"])
+    api_key = relay.get("api_key")
+    if not api_key:
+        die("relay %s missing api_key" % name)
+    display_name = relay.get("display_name") or name
+
+    print("fetching models from %s ..." % base_url)
+    src_url, models, status = fetch_models(base_url, api_key)
+    print("ok HTTP %s via %s (%d models)" % (status, src_url, len(models)))
+
+    if not os.path.isfile(CONFIG_PATH):
+        die("missing %s" % CONFIG_PATH)
+    with open(CONFIG_PATH, "r") as f:
+        config_text = f.read()
+    current_model = read_current_model(config_text)
+    model = pick_model(models, data.get("preferred_models"), current_model)
+
+    # Backup once per switch.
+    for path in (CONFIG_PATH, AUTH_PATH, CATALOG_PATH):
+        if os.path.isfile(path):
+            bak = path + ".bak"
+            if not os.path.isfile(bak):
+                shutil.copy2(path, bak)
+
+    catalog = build_catalog(models)
+    write_json(CATALOG_PATH, catalog)
+    print("wrote catalog: %s (%d models)" % (CATALOG_PATH, len(models)))
+
+    write_json(AUTH_PATH, {"OPENAI_API_KEY": api_key})
+    try:
+        os.chmod(AUTH_PATH, 0o600)
+    except OSError:
+        pass
+    print("updated auth.json")
+
+    new_config = update_config(config_text, display_name, base_url, model)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new_config)
+    os.rename(tmp, CONFIG_PATH)
+    print("updated config.toml -> provider=%s model=%s" % (display_name, model))
+
+    if not sync_only:
+        data["current"] = name
+        save_relays(data)
+        print("current relay set to: %s" % name)
+
+    print("\nmodels:")
+    for m in models:
+        mark = " <-" if m["id"] == model else ""
+        print("  - %s%s" % (m["id"], mark))
+    print("\nReload Cursor / restart Codex sidebar to pick up the change.")
+
+
+def cmd_add(data, name, base_url, api_key, display_name=None):
+    if not re.match(r"^[A-Za-z0-9_-]+$", name):
+        die("name must be [A-Za-z0-9_-]+")
+    data["relays"][name] = {
+        "display_name": display_name or name,
+        "base_url": normalize_base_url(base_url),
+        "api_key": api_key,
+    }
+    save_relays(data)
+    print("added relay %s (%s)" % (name, normalize_base_url(base_url)))
+    print("switch with: codex-relay use %s" % name)
+
+
+def cmd_remove(data, name):
+    if name not in data["relays"]:
+        die("unknown relay %r" % name)
+    if data.get("current") == name:
+        die("cannot remove current relay; switch first")
+    del data["relays"][name]
+    save_relays(data)
+    print("removed %s" % name)
+
+
+def cmd_rename(data, old, new):
+    if old not in data["relays"]:
+        die("unknown relay %r — known: %s" % (old, ", ".join(sorted(data["relays"]))))
+    if not re.match(r"^[A-Za-z0-9_-]+$", new):
+        die("new name must be [A-Za-z0-9_-]+")
+    if old == new:
+        die("old and new names are the same")
+    if new in data["relays"]:
+        die("relay %r already exists" % new)
+    data["relays"][new] = data["relays"].pop(old)
+    # Keep display_name if user set a custom one; if it was just the old id, follow rename.
+    disp = data["relays"][new].get("display_name")
+    if not disp or disp == old:
+        data["relays"][new]["display_name"] = new
+    if data.get("current") == old:
+        data["current"] = new
+    save_relays(data)
+    print("renamed %s -> %s" % (old, new))
+    if data.get("current") == new:
+        print("current relay is now: %s" % new)
+
+
+def usage():
+    print(
+        """codex-relay — Codex 中转一键切换工具（切换 URL/Key，并回填模型列表）
+
+用法:
+  codex-relay list                          列出所有中转（* 为当前）
+  codex-relay current                       显示当前中转详情
+  codex-relay use <名字>                    切换到该中转，并拉取模型列表
+  codex-relay sync                          刷新当前中转的模型列表
+  codex-relay add <名字> <url> <key> [显示名]  新增一套中转
+  codex-relay rename <旧名> <新名>          重命名中转（可用 mv）
+  codex-relay rm <名字>                     删除中转（不能删当前）
+  codex-relay help                          显示本帮助
+
+配置文件: ~/.codex/relays.json
+也可直接改该文件后执行: codex-relay use <名字>
+"""
+    )
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        usage()
+        return 0
+    cmd = argv[1]
+    data = load_relays()
+    if cmd == "list":
+        cmd_list(data)
+    elif cmd == "current":
+        cmd_current(data)
+    elif cmd == "use":
+        if len(argv) < 3:
+            die("用法: codex-relay use <名字>")
+        apply_relay(data, argv[2], sync_only=False)
+    elif cmd == "sync":
+        cur = data.get("current")
+        if not cur:
+            die("当前未设置中转；请先执行: codex-relay use <名字>")
+        apply_relay(data, cur, sync_only=True)
+    elif cmd == "add":
+        if len(argv) < 5:
+            die("用法: codex-relay add <名字> <url> <key> [显示名]")
+        display = argv[5] if len(argv) > 5 else None
+        cmd_add(data, argv[2], argv[3], argv[4], display)
+    elif cmd in ("rm", "remove"):
+        if len(argv) < 3:
+            die("用法: codex-relay rm <名字>")
+        cmd_remove(data, argv[2])
+    elif cmd in ("rename", "mv"):
+        if len(argv) < 4:
+            die("用法: codex-relay rename <旧名> <新名>")
+        cmd_rename(data, argv[2], argv[3])
+    else:
+        die("未知命令 %r\n请执行: codex-relay help" % cmd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

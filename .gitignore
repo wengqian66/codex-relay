@@ -1,0 +1,15 @@
+# Local relay configuration can contain API credentials.
+.codex/
+relays.json
+auth.json
+cc-switch-model-catalog.json
+
+# Common secret files.
+.env
+.env.*
+!.env.example
+*.key
+
+# Python build artifacts.
+__pycache__/
+*.py[cod]
