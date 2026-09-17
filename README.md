@@ -66,13 +66,13 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/inst
 ## 使用
 
 ```sh
-codex-relay add <名称> <URL> <API_KEY> [显示名]
-codex-relay list
-codex-relay use <名称>
-codex-relay current
-codex-relay sync
-codex-relay quota              # 查询当前中转额度
-codex-relay quota <名称>       # 查询指定中转额度
+codex-relay add <名称> <URL> <API_KEY> [显示名]  # 新增一套中转配置
+codex-relay list                                  # 列出全部中转；* 表示当前正在使用的中转
+codex-relay use <名称>                            # 切换到指定中转，并从服务端刷新模型列表
+codex-relay current                               # 显示当前中转、服务地址和当前模型（API Key 会脱敏）
+codex-relay sync                                  # 刷新当前中转的模型列表，不切换中转
+codex-relay quota                                 # 查询当前中转的可用状态与剩余额度
+codex-relay quota <名称>                          # 查询指定中转的可用状态与剩余额度
 ```
 
 `quota` 会向 `<URL>/v1/usage` 发送带 Bearer API Key 的只读请求，并兼容下列响应字段：
