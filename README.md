@@ -49,6 +49,20 @@ test -f ~/.codex/config.toml && echo '~/.codex/config.toml exists'
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+## 用 Codex Skill 安装
+
+仓库内提供可复用的 Skill：[`skills/codex-relay-install`](skills/codex-relay-install)。其他 Linux/WSL 用户可让自己的 Codex 智能体安装该 Skill，再让它完成 `codex-relay` 的安装、更新和验证。
+
+如果目标环境包含 Codex 的 `skill-installer`，可执行：
+
+```sh
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-installer/scripts/install-skill-from-github.py" \
+  --repo wengqian66/codex-relay \
+  --path skills/codex-relay-install
+```
+
+安装 Skill 后，在下一轮对话中直接让智能体“安装或更新 codex-relay”。Skill 不会要求把 API Key 发到聊天中；配置中转时会提供本地终端命令模板，由用户自行输入密钥。
+
 ## 使用
 
 ```sh
