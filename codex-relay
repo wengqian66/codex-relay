@@ -138,6 +138,91 @@ def fetch_models(base_url, api_key):
     die("failed to fetch models: %s" % (last_err or "unknown"))
 
 
+def fetch_usage(base_url, api_key):
+    """Fetch one relay's current remaining quota from its usage endpoint."""
+    url = normalize_base_url(base_url) + "/v1/usage"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Accept": "application/json",
+            "User-Agent": "codex-relay/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            status = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:200].decode("utf-8", "replace").strip()
+        suffix = ": " + detail if detail else ""
+        die("failed to fetch quota: HTTP %s for %s%s" % (e.code, url, suffix))
+    except Exception as e:
+        die("failed to fetch quota from %s: %s" % (url, e))
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        die("failed to fetch quota: non-JSON from %s: %s" % (url, body[:200]))
+    if not isinstance(payload, dict):
+        die("failed to fetch quota: unexpected JSON from %s" % url)
+    return url, payload, status
+
+
+def first_present(*values):
+    """Return the first value that is present, preserving valid falsy values like 0."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def extract_usage(payload):
+    """Normalize the quota response formats supported by Codex relay providers."""
+    quota = payload.get("quota")
+    if not isinstance(quota, dict):
+        quota = {}
+    return {
+        "is_valid": first_present(payload.get("is_active"), payload.get("isValid"), True),
+        "remaining": first_present(
+            payload.get("remaining"), quota.get("remaining"), payload.get("balance")
+        ),
+        "unit": first_present(payload.get("unit"), quota.get("unit"), "USD"),
+    }
+
+
+def format_value(value):
+    if value is None:
+        return "unknown"
+    return str(value)
+
+
+def cmd_quota(data, name=None):
+    name = name or data.get("current")
+    if not name:
+        die("当前未设置中转；请先执行: codex-relay use <名字>")
+    if name not in data["relays"]:
+        die("unknown relay %r — known: %s" % (name, ", ".join(sorted(data["relays"]))))
+
+    relay = data["relays"][name]
+    base_url = normalize_base_url(relay.get("base_url", ""))
+    api_key = relay.get("api_key")
+    if not base_url:
+        die("relay %s missing base_url" % name)
+    if not api_key:
+        die("relay %s missing api_key" % name)
+
+    url, payload, status = fetch_usage(base_url, api_key)
+    quota = extract_usage(payload)
+    active = "active" if quota["is_valid"] else "inactive"
+
+    print("relay: %s" % name)
+    print("usage_url: %s" % url)
+    print("HTTP: %s" % status)
+    print("status: %s" % active)
+    print("remaining: %s %s" % (format_value(quota["remaining"]), quota["unit"]))
+
+
 def build_catalog(models):
     out = []
     for i, m in enumerate(models):
@@ -393,6 +478,7 @@ def usage():
   codex-relay current                       显示当前中转详情
   codex-relay use <名字>                    切换到该中转，并拉取模型列表
   codex-relay sync                          刷新当前中转的模型列表
+  codex-relay quota [名字]                   查询当前或指定中转的剩余额度
   codex-relay add <名字> <url> <key> [显示名]  新增一套中转
   codex-relay rename <旧名> <新名>          重命名中转（可用 mv）
   codex-relay rm <名字>                     删除中转（不能删当前）
@@ -423,6 +509,10 @@ def main(argv):
         if not cur:
             die("当前未设置中转；请先执行: codex-relay use <名字>")
         apply_relay(data, cur, sync_only=True)
+    elif cmd == "quota":
+        if len(argv) > 3:
+            die("用法: codex-relay quota [名字]")
+        cmd_quota(data, argv[2] if len(argv) == 3 else None)
     elif cmd == "add":
         if len(argv) < 5:
             die("用法: codex-relay add <名字> <url> <key> [显示名]")

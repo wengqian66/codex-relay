@@ -8,6 +8,7 @@
 - 切换中转时同步更新 `~/.codex/config.toml`、`~/.codex/auth.json` 和模型目录。
 - 中转数据保存在 `~/.codex/relays.json`，新建文件权限为 `600`。
 - `current` 仅显示 API Key 的前 8 位和后 4 位，便于识别且避免完整回显。
+- `quota` 通过当前中转的 `GET /v1/usage` 查询可用状态与剩余额度，且不会回显 API Key。
 - 项目不会保存 API Key；`.gitignore` 会忽略常见本地密钥和 Codex 配置文件。
 
 ## 前提条件
@@ -56,6 +57,17 @@ codex-relay list
 codex-relay use <名称>
 codex-relay current
 codex-relay sync
+codex-relay quota              # 查询当前中转额度
+codex-relay quota <名称>       # 查询指定中转额度
+```
+
+`quota` 会向 `<URL>/v1/usage` 发送带 Bearer API Key 的只读请求，并兼容下列响应字段：
+
+- 剩余额度：`remaining`、`quota.remaining` 或 `balance`
+- 单位：`unit`、`quota.unit`，缺失时显示 `USD`
+- 有效状态：`is_active` 或 `isValid`，缺失时默认显示为有效
+
+若中转未实现 `/v1/usage` 或返回非 JSON，命令会输出请求失败原因；不会在输出中显示 API Key。
 ```
 
 示例中的 `<API_KEY>` 只应在你的本地终端输入。不要把 API Key 写入脚本、README、提交记录或 Git 仓库。
@@ -104,6 +116,8 @@ API Key 存在 `~/.codex/relays.json` 时，该文件应为 `600`。命令本身
 
 ```sh
 python3 -m py_compile ~/.local/bin/codex-relay
+python3 -m unittest discover -s tests -v
 command -v codex-relay
 codex-relay help
+codex-relay quota
 ```
