@@ -1,0 +1,4 @@
+# Keep repository text files portable for WSL and GitHub rendering.
+*.md text eol=lf
+*.sh text eol=lf
+codex-relay text eol=lf
